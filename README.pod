@@ -2,7 +2,7 @@
 
 lemonbar - Featherweight lemon-scented bar
 
-This fork is patched to add XFT support, and optional borders around the bar, to the 1.4 release of Lemonbar 
+This fork is an attempt to add XFT support, and optional borders around the bar, to the 1.4 release of Lemonbar. Other XFT patched forks are based on older Lemonbar releases
 
 The XFT code is reused from Protesilaos Stavrou's fork https://gitlab.com/protesilaos/lemonbar-xft and all credit goes to the original author(s)! I simply ported the code the 1.4 release of Lemonbar and fixed as many resulting bugs I could find
 
