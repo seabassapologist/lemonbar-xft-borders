@@ -1,11 +1,13 @@
 // vim:sw=4:ts=4:et:
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <signal.h>
 #include <poll.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <unistd.h>
 #include <errno.h>
@@ -18,6 +20,9 @@
 #include <xcb/randr.h>
 #include "utils.h"
 
+#include <X11/Xft/Xft.h>
+#include <X11/Xlib-xcb.h>
+
 // Here be dragons
 
 #define max(a,b) ((a) > (b) ? (a) : (b))
@@ -25,7 +30,8 @@
 
 typedef struct font_t {
     xcb_font_t ptr;
-    int descent, height, width;
+    XftFont *xft_ft;
+    int ascent, descent, height, width;
     uint16_t char_max;
     uint16_t char_min;
     xcb_charinfo_t *width_lut;
@@ -82,15 +88,21 @@ enum {
     GC_MAX
 };
 
+static Display *dpy;
 static xcb_connection_t *c;
 static xcb_screen_t *scr;
+static int scr_nbr = 0;
 static xcb_gcontext_t gc[GC_MAX];
 static xcb_visualid_t visual;
+static Visual *visual_ptr;
 static xcb_colormap_t colormap;
 static monitor_t *monhead, *montail;
 static font_t **font_list = NULL;
 static int font_count = 0;
 static int font_index = -1;
+static int offsets_y[5];
+static int offset_y_count = 0;
+static int offset_y_index = 0;
 static uint32_t attrs = 0;
 static bool dock = false;
 static bool topbar = true;
@@ -99,6 +111,14 @@ static int bu = 1; // Underline height
 static rgba_t fgc, bgc, ugc;
 static rgba_t dfgc, dbgc, dugc;
 static area_stack_t area_stack;
+
+static XftColor sel_fg;
+static XftDraw *xft_draw;
+
+//char width lookuptable
+#define MAX_WIDTHS (1 << 16)
+static wchar_t xft_char[MAX_WIDTHS];
+static char    xft_width[MAX_WIDTHS];
 
 static const rgba_t BLACK = (rgba_t){ .r = 0, .g = 0, .b = 0, .a = 255 };
 static const rgba_t WHITE = (rgba_t){ .r = 255, .g = 255, .b = 255, .a = 255 };
@@ -112,6 +132,13 @@ update_gc (void)
     xcb_change_gc(c, gc[GC_DRAW], XCB_GC_FOREGROUND, (const uint32_t []){ fgc.v });
     xcb_change_gc(c, gc[GC_CLEAR], XCB_GC_FOREGROUND, (const uint32_t []){ bgc.v });
     xcb_change_gc(c, gc[GC_ATTR], XCB_GC_FOREGROUND, (const uint32_t []){ ugc.v });
+    XftColorFree(dpy, visual_ptr, colormap , &sel_fg);
+    char color[] = "#ffffff";
+    uint32_t nfgc = fgc.v & 0x00ffffff;
+    snprintf(color, sizeof(color), "#%06X", nfgc);
+    if (!XftColorAllocName (dpy, visual_ptr, colormap, color, &sel_fg)) {
+    	fprintf(stderr, "Couldn't allocate xft font color '%s'\n", color);
+    }
 }
 
 void
@@ -166,6 +193,39 @@ xcb_void_cookie_t xcb_poly_text_16_simple(xcb_connection_t * c,
 }
 
 int
+xft_char_width_slot (uint16_t ch)
+{
+    int slot = ch % MAX_WIDTHS;
+    while (xft_char[slot] != 0 && xft_char[slot] != ch)
+    {
+        slot = (slot + 1) % MAX_WIDTHS;
+    }
+    return slot;
+}
+
+int xft_char_width (uint16_t ch, font_t *cur_font)
+{
+    int slot = xft_char_width_slot(ch);
+    if (!xft_char[slot]) {
+        XGlyphInfo gi;
+        FT_UInt glyph = XftCharIndex (dpy, cur_font->xft_ft, (FcChar32) ch);
+        XftFontLoadGlyphs (dpy, cur_font->xft_ft, FcFalse, &glyph, 1);
+        XftGlyphExtents (dpy, cur_font->xft_ft, &glyph, 1, &gi);
+        XftFontUnloadGlyphs (dpy, cur_font->xft_ft, &glyph, 1);
+        xft_char[slot] = ch;
+        if (gi.xOff >= gi.width) {
+            xft_width[slot] = gi.xOff;
+        } else {
+            xft_width[slot] = gi.width;
+        }
+        return xft_width[slot];
+    } else if (xft_char[slot] == ch)
+        return xft_width[slot];
+    else
+        return 0;
+}
+
+int
 shift (monitor_t *mon, int x, int align, int ch_width)
 {
     switch (align) {
@@ -210,19 +270,30 @@ draw_shift (monitor_t *mon, int x, int align, int w)
 int
 draw_char (monitor_t *mon, font_t *cur_font, int x, int align, uint16_t ch)
 {
-    int ch_width = (cur_font->width_lut) ?
-        cur_font->width_lut[ch - cur_font->char_min].character_width:
-        cur_font->width;
+    int ch_width;
+
+    if (cur_font->xft_ft) {
+        ch_width = xft_char_width(ch, cur_font);
+    } else {
+        ch_width = (cur_font->width_lut) ?
+             cur_font->width_lut[ch - cur_font->char_min].character_width:
+             cur_font->width;
+    }
 
     x = shift(mon, x, align, ch_width);
 
-    // xcb accepts string in UCS-2 BE, so swap
-    ch = (ch >> 8) | (ch << 8);
+    int y = bh / 2 + cur_font->height / 2- cur_font->descent + offsets_y[offset_y_index];
+    if (cur_font->xft_ft) {
+        XftDrawString16 (xft_draw, &sel_fg, cur_font->xft_ft, x,y, &ch, 1);
+    } else {
+        /* xcb accepts string in UCS-2 BE, so swap */
+     	ch = (ch >> 8) | (ch << 8);
 
-    // The coordinates here are those of the baseline
-    xcb_poly_text_16_simple(c, mon->pixmap, gc[GC_DRAW],
-                            x, bh / 2 + cur_font->height / 2 - cur_font->descent,
+     	// The coordinates here are those of the baseline
+     	xcb_poly_text_16_simple(c, mon->pixmap, gc[GC_DRAW],
+                            x, y,
                             1, &ch);
+    }
 
     draw_lines(mon, x, ch_width);
 
@@ -439,6 +510,14 @@ area_add (char *str, const char *optend, char **end, monitor_t *mon, const int x
 bool
 font_has_glyph (font_t *font, const uint16_t c)
 {
+	if (font->xft_ft) {
+		if (XftCharExists(dpy, font->xft_ft, (FcChar32) c)) {
+			return true;
+		} else {
+			return false;
+		}
+	}
+
     if (c < font->char_min || c > font->char_max)
         return false;
 
@@ -453,14 +532,18 @@ font_t *
 select_drawable_font (const uint16_t c)
 {
     // If the user has specified a font to use, try that first.
-    if (font_index != -1 && font_has_glyph(font_list[font_index - 1], c))
+    if (font_index != -1 && font_has_glyph(font_list[font_index - 1], c)) {
+    	offset_y_index = font_index - 1;
         return font_list[font_index - 1];
+    }
 
     // If the end is reached without finding an appropriate font, return NULL.
     // If the font can draw the character, return it.
     for (int i = 0; i < font_count; i++) {
-        if (font_has_glyph(font_list[i], c))
+        if (font_has_glyph(font_list[i], c)) {
+        	offset_y_index = i;
             return font_list[i];
+        }
     }
     return NULL;
 }
@@ -503,9 +586,15 @@ parse (char *text)
     for (monitor_t *m = monhead; m != NULL; m = m->next)
         fill_rect(m->pixmap, gc[GC_CLEAR], 0, 0, m->width, bh);
 
+    /* Create xft drawable */
+    if (!(xft_draw = XftDrawCreate (dpy, cur_mon->pixmap, visual_ptr , colormap))) {
+		fprintf(stderr, "Couldn't create xft drawable\n");
+	}
+
+
     for (;;) {
         if (*p == '\0' || *p == '\n')
-            return;
+            break;
 
         if (p[0] == '%' && p[1] == '{' && (block_end = strchr(p++, '}'))) {
             p++;
@@ -618,6 +707,11 @@ parse (char *text)
                                 break;
                         }
 
+                        XftDrawDestroy (xft_draw);
+                        if (!(xft_draw = XftDrawCreate (dpy, cur_mon->pixmap, visual_ptr , colormap ))) {
+                        	fprintf(stderr, "Couldn't create xft drawable\n");
+                        }
+
                         if (orig_mon != cur_mon) {
                             pos_x = 0;
                             align = ALIGN_L;
@@ -712,7 +806,10 @@ parse (char *text)
             if (!cur_font)
                 continue;
 
-            xcb_change_gc(c, gc[GC_DRAW] , XCB_GC_FONT, (const uint32_t []){ cur_font->ptr });
+            if(cur_font->ptr)
+                xcb_change_gc(c, gc[GC_DRAW] , XCB_GC_FONT, (const uint32_t []) {
+                cur_font->ptr
+            });
 
             int w = draw_char(cur_mon, cur_font, pos_x, align, ucs);
 
@@ -720,6 +817,7 @@ parse (char *text)
             area_shift(cur_mon->window, align, w);
         }
     }
+    XftDrawDestroy (xft_draw);
 }
 
 void
@@ -732,40 +830,62 @@ font_load (const char *pattern)
 
     font = xcb_generate_id(c);
 
-    cookie = xcb_open_font_checked(c, font, strlen(pattern), pattern);
-    if (xcb_request_check (c, cookie)) {
-        fprintf(stderr, "Could not load font \"%s\"\n", pattern);
-        return;
-    }
-
     font_t *ret = xcalloc(1, sizeof(font_t));
 
-    queryreq = xcb_query_font(c, font);
-    font_info = xcb_query_font_reply(c, queryreq, NULL);
+    cookie = xcb_open_font_checked(c, font, strlen(pattern), pattern);
+    if (!xcb_request_check (c, cookie)) {
 
-    ret->ptr = font;
-    ret->descent = font_info->font_descent;
-    ret->height = font_info->font_ascent + font_info->font_descent;
-    ret->width = font_info->max_bounds.character_width;
-    ret->char_max = font_info->max_byte1 << 8 | font_info->max_char_or_byte2;
-    ret->char_min = font_info->min_byte1 << 8 | font_info->min_char_or_byte2;
+    	queryreq = xcb_query_font(c, font);
+    	font_info = xcb_query_font_reply(c, queryreq, NULL);
 
-    // Copy over the width lut as it's part of font_info
-    size_t lut_size = sizeof(xcb_charinfo_t) *
+		ret->xft_ft = NULL;
+    	ret->ptr = font;
+    	ret->descent = font_info->font_descent;
+    	ret->height = font_info->font_ascent + font_info->font_descent;
+    	ret->width = font_info->max_bounds.character_width;
+    	ret->char_max = font_info->max_byte1 << 8 | font_info->max_char_or_byte2;
+    	ret->char_min = font_info->min_byte1 << 8 | font_info->min_char_or_byte2;
+
+    	// Copy over the width lut as it's part of font_info
+    	size_t lut_size = sizeof(xcb_charinfo_t) *
             xcb_query_font_char_infos_length(font_info);
-    if (lut_size) {
-        ret->width_lut = xmalloc(lut_size);
-        memcpy(ret->width_lut, xcb_query_font_char_infos(font_info), lut_size);
+    	if (lut_size) {
+        	ret->width_lut = xmalloc(lut_size);
+        	memcpy(ret->width_lut, xcb_query_font_char_infos(font_info), lut_size);
+    	}
+
+    	free(font_info);
+	} else if ((ret->xft_ft = XftFontOpenName (dpy, scr_nbr, pattern))) {
+		ret->ptr = 0;
+        ret->ascent = ret->xft_ft->ascent;
+        ret->descent = ret->xft_ft->descent;
+        ret->height = ret->ascent + ret->descent;
+    } else {
+        fprintf(stderr, "Could not load font %s\n", pattern);
+        free(ret);
+        return;
     }
-
-    free(font_info);
-
     font_list = xreallocarray(font_list, font_count + 1, sizeof(font_t));
     if (!font_list) {
         fprintf(stderr, "Failed to allocate %d font descriptors", font_count + 1);
         exit(EXIT_FAILURE);
     }
     font_list[font_count++] = ret;
+}
+
+void add_y_offset(int offset) {
+    if (offset_y_count >= 5) {
+        fprintf(stderr, "Max offset count reached. Could not set offset \"%d\"\n", offset);
+        return;
+    }
+
+    offsets_y[offset_y_count] = strtol(optarg, NULL, 10);
+    if (offset_y_count == 0) {
+        for (int i = 1; i < 5; ++i) {
+            offsets_y[i] = offsets_y[0];
+        }
+    }
+    ++offset_y_count;
 }
 
 enum {
@@ -826,7 +946,7 @@ set_ewmh_atoms (void)
 
         xcb_change_property(c, XCB_PROP_MODE_REPLACE, mon->window, atom_list[NET_WM_WINDOW_TYPE], XCB_ATOM_ATOM, 32, 1, &atom_list[NET_WM_WINDOW_TYPE_DOCK]);
         xcb_change_property(c, XCB_PROP_MODE_APPEND,  mon->window, atom_list[NET_WM_STATE], XCB_ATOM_ATOM, 32, 2, &atom_list[NET_WM_STATE_STICKY]);
-        xcb_change_property(c, XCB_PROP_MODE_REPLACE, mon->window, atom_list[NET_WM_DESKTOP], XCB_ATOM_CARDINAL, 32, 1, (const uint32_t []){ -1 } );
+        xcb_change_property(c, XCB_PROP_MODE_REPLACE, mon->window, atom_list[NET_WM_DESKTOP], XCB_ATOM_CARDINAL, 32, 1, (const uint32_t []){ 0u - 1u } );
         xcb_change_property(c, XCB_PROP_MODE_REPLACE, mon->window, atom_list[NET_WM_STRUT_PARTIAL], XCB_ATOM_CARDINAL, 32, 12, strut);
         xcb_change_property(c, XCB_PROP_MODE_REPLACE, mon->window, atom_list[NET_WM_STRUT], XCB_ATOM_CARDINAL, 32, 4, strut);
         xcb_change_property(c, XCB_PROP_MODE_REPLACE, mon->window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8, 3, "bar");
@@ -1121,21 +1241,19 @@ get_xinerama_monitors (void)
 xcb_visualid_t
 get_visual (void)
 {
-    xcb_depth_iterator_t iter;
+	XVisualInfo xv;
+	xv.depth = 32;
+	int result = 0;
+	XVisualInfo* result_ptr = NULL;
+	result_ptr = XGetVisualInfo(dpy, VisualDepthMask, &xv, &result);
 
-    iter = xcb_screen_allowed_depths_iterator(scr);
-
-    // Try to find a RGBA visual
-    while (iter.rem) {
-        xcb_visualtype_t *vis = xcb_depth_visuals(iter.data);
-
-        if (iter.data->depth == 32)
-            return vis->visual_id;
-
-        xcb_depth_next(&iter);
-    }
+	if (result > 0) {
+		visual_ptr = result_ptr->visual;
+		return result_ptr->visualid;
+	}
 
     // Fallback to the default one
+    visual_ptr = DefaultVisual(dpy, scr_nbr);
     return scr->root_visual;
 }
 
@@ -1202,8 +1320,18 @@ parse_output_string(char *str)
 void
 xconn (void)
 {
-    // Connect to X
-    c = xcb_connect (NULL, NULL);
+	// Connect to X
+	if ((dpy = XOpenDisplay(0)) == NULL) {
+        fprintf (stderr, "Couldnt open display\n");
+    }
+
+    if ((c = XGetXCBConnection(dpy)) == NULL) {
+        fprintf (stderr, "Couldnt connect to X\n");
+        exit (EXIT_FAILURE);
+    }
+
+	XSetEventQueueOwner(dpy, XCBOwnsEventQueue);
+
     if (xcb_connection_has_error(c)) {
         fprintf(stderr, "Couldn't connect to X\n");
         exit(EXIT_FAILURE);
@@ -1220,7 +1348,7 @@ xconn (void)
 }
 
 void
-init (char *wm_name)
+init (char *wm_name, char *wm_instance)
 {
     // Try to load a default font
     if (font_count == 0)
@@ -1320,7 +1448,33 @@ init (char *wm_name)
         // Set the WM_NAME atom to the user specified value
         if (wm_name)
             xcb_change_property(c, XCB_PROP_MODE_REPLACE, mon->window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8 ,strlen(wm_name), wm_name);
+
+        // set the WM_CLASS atom instance to the executable name
+        if (wm_instance) {
+            char *wm_class;
+            int wm_class_offset, wm_class_len;
+            // WM_CLASS is nullbyte seperated: wm_instance + "\0Bar\0"
+            wm_class_offset = strlen(wm_instance) + 1;
+            wm_class_len = wm_class_offset + 4;
+
+            wm_class = calloc(1, wm_class_len + 1);
+            strcpy(wm_class, wm_instance);
+            strcpy(wm_class+wm_class_offset, "Bar");
+
+            xcb_change_property(c, XCB_PROP_MODE_REPLACE, mon->window, XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 8, wm_class_len, wm_class);
+
+            free(wm_class);
+    	}
+
     }
+
+    char color[] = "#ffffff";
+    uint32_t nfgc = fgc.v & 0x00ffffff;
+    snprintf(color, sizeof(color), "#%06X", nfgc);
+
+    if (!XftColorAllocName (dpy, visual_ptr, colormap, color, &sel_fg)) {
+        fprintf(stderr, "Couldn't allocate xft font color '%s'\n", color);
+	}
 
     xcb_flush(c);
 }
@@ -1335,12 +1489,16 @@ cleanup (void)
 
     free(area_stack.ptr);
 
-    for (int i = 0; i < font_count; i++) {
-        xcb_close_font(c, font_list[i]->ptr);
-        free(font_list[i]->width_lut);
-        free(font_list[i]);
-    }
-    free(font_list);
+    for (int i = 0; i < font_list[i]; i++) {
+        if (font_list[i]->xft_ft) {
+            XftFontClose (dpy, font_list[i]->xft_ft);
+        }
+        else {
+             xcb_close_font(c, font_list[i]->ptr);
+             free(font_list[i]->width_lut);
+        }
+         free(font_list[i]);
+     }
 
     while (monhead) {
         monitor_t *next = monhead->next;
@@ -1351,7 +1509,7 @@ cleanup (void)
         monhead = next;
     }
 
-    xcb_free_colormap(c, colormap);
+    XftColorFree(dpy, visual_ptr, colormap, &sel_fg);
 
     if (gc[GC_DRAW])
         xcb_free_gc(c, gc[GC_DRAW]);
@@ -1361,6 +1519,21 @@ cleanup (void)
         xcb_free_gc(c, gc[GC_ATTR]);
     if (c)
         xcb_disconnect(c);
+}
+
+char*
+strip_path(char *path)
+{
+    char *slash;
+
+    if (path == NULL || *path == '\0')
+        return strdup("lemonbar");
+
+    slash = strrchr(path, '/');
+    if (slash != NULL)
+        return strndup(slash + 1, 31);
+
+    return strndup(path, 31);
 }
 
 void
@@ -1386,6 +1559,7 @@ main (int argc, char **argv)
     int geom_v[4] = { -1, -1, 0, 0 };
     int ch;
     char *wm_name;
+    char *instance_name;
 
     // Install the parachute!
     atexit(cleanup);
@@ -1400,10 +1574,12 @@ main (int argc, char **argv)
     // A safe default
     wm_name = NULL;
 
+    instance_name = strip_path(argv[0]);
+
     // Connect to the Xserver and initialize scr
     xconn();
 
-    while ((ch = getopt(argc, argv, "hg:o:bdf:a:pu:B:F:U:n:")) != -1) {
+    while ((ch = getopt(argc, argv, "hg:o:bdf:a:pu:B:F:U:n:y")) != -1) {
         switch (ch) {
             case 'h':
                 printf ("lemonbar version %s\n", VERSION);
@@ -1418,7 +1594,8 @@ main (int argc, char **argv)
                         "\t-n Set the WM_NAME atom to the specified value for this bar\n"
                         "\t-u Set the underline/overline height in pixels\n"
                         "\t-B Set background color in #AARRGGBB\n"
-                        "\t-F Set foreground color in #AARRGGBB\n", argv[0]);
+                        "\t-F Set foreground color in #AARRGGBB\n"
+                        "\t-y Add a vertical offset to the text, it can be negative\n", argv[0]);
                 exit (EXIT_SUCCESS);
             case 'g': (void)parse_geometry_string(optarg, geom_v); break;
             case 'o': (void)parse_output_string(optarg); break;
@@ -1431,6 +1608,7 @@ main (int argc, char **argv)
             case 'B': dbgc = bgc = parse_color(optarg, NULL, BLACK); break;
             case 'F': dfgc = fgc = parse_color(optarg, NULL, WHITE); break;
             case 'U': dugc = ugc = parse_color(optarg, NULL, fgc); break;
+            case 'y': add_y_offset(strtol(optarg, NULL, 10)); break;
         }
     }
 
@@ -1446,11 +1624,15 @@ main (int argc, char **argv)
     by = geom_v[3];
 
     // Do the heavy lifting
-    init(wm_name);
+    init(wm_name, instance_name);
     // The string is strdup'd when the command line arguments are parsed
     free(wm_name);
+    // The string is strdup'd when stripping argv[0]
+    free(instance_name);
     // Get the fd to Xserver
     pollin[1].fd = xcb_get_file_descriptor(c);
+    // Prevent fgets to block
+    fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
 
 #ifdef __OpenBSD__
     if (pledge("stdio rpath", NULL) < 0) {
