@@ -20,6 +20,10 @@
 #include <xcb/randr.h>
 #include "utils.h"
 
+#ifdef __OpenBSD__
+#include <err.h>
+#endif
+
 #include <X11/Xft/Xft.h>
 #include <X11/Xlib-xcb.h>
 
@@ -1489,7 +1493,7 @@ cleanup (void)
 
     free(area_stack.ptr);
 
-    for (int i = 0; i < font_list[i]; i++) {
+    for (int i = 0; i < font_count; i++) {
         if (font_list[i]->xft_ft) {
             XftFontClose (dpy, font_list[i]->xft_ft);
         }

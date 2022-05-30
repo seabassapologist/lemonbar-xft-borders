@@ -2,3 +2,4 @@ lemonbar
 *.o
 *.swp
 *~
+*.core
