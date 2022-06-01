@@ -104,9 +104,6 @@ static monitor_t *monhead, *montail;
 static font_t **font_list = NULL;
 static int font_count = 0;
 static int font_index = -1;
-static int offsets_y[5];
-static int offset_y_count = 0;
-static int offset_y_index = 0;
 static uint32_t attrs = 0;
 static bool dock = false;
 static bool topbar = true;
@@ -296,7 +293,7 @@ draw_char (monitor_t *mon, font_t *cur_font, int x, int align, uint16_t ch)
 
     x = shift(mon, x, align, ch_width);
 
-    int y = bh / 2 + cur_font->height / 2- cur_font->descent + offsets_y[offset_y_index];
+    int y = bh / 2 + cur_font->height / 2- cur_font->descent;
     if (cur_font->xft_ft) {
         XftDrawString16 (xft_draw, &sel_fg, cur_font->xft_ft, x,y, &ch, 1);
     } else {
@@ -547,7 +544,6 @@ select_drawable_font (const uint16_t c)
 {
     // If the user has specified a font to use, try that first.
     if (font_index != -1 && font_has_glyph(font_list[font_index - 1], c)) {
-    	offset_y_index = font_index - 1;
         return font_list[font_index - 1];
     }
 
@@ -555,7 +551,6 @@ select_drawable_font (const uint16_t c)
     // If the font can draw the character, return it.
     for (int i = 0; i < font_count; i++) {
         if (font_has_glyph(font_list[i], c)) {
-        	offset_y_index = i;
             return font_list[i];
         }
     }
@@ -890,21 +885,6 @@ font_load (const char *pattern)
         exit(EXIT_FAILURE);
     }
     font_list[font_count++] = ret;
-}
-
-void add_y_offset(int offset) {
-    if (offset_y_count >= 5) {
-        fprintf(stderr, "Max offset count reached. Could not set offset \"%d\"\n", offset);
-        return;
-    }
-
-    offsets_y[offset_y_count] = strtol(optarg, NULL, 10);
-    if (offset_y_count == 0) {
-        for (int i = 1; i < 5; ++i) {
-            offsets_y[i] = offsets_y[0];
-        }
-    }
-    ++offset_y_count;
 }
 
 enum {
@@ -1614,8 +1594,7 @@ main (int argc, char **argv)
                         "\t-n Set the WM_NAME atom to the specified value for this bar\n"
                         "\t-u Set the underline/overline height in pixels\n"
                         "\t-B Set background color in #AARRGGBB\n"
-                        "\t-F Set foreground color in #AARRGGBB\n"
-                        "\t-y Add a vertical offset to the text, it can be negative\n", argv[0]);
+                        "\t-F Set foreground color in #AARRGGBB\n", argv[0]);
                 exit (EXIT_SUCCESS);
             case 'g': (void)parse_geometry_string(optarg, geom_v); break;
             case 'o': (void)parse_output_string(optarg); break;
@@ -1628,7 +1607,6 @@ main (int argc, char **argv)
             case 'B': dbgc = bgc = parse_color(optarg, NULL, BLACK); break;
             case 'F': dfgc = fgc = parse_color(optarg, NULL, WHITE); break;
             case 'U': dugc = ugc = parse_color(optarg, NULL, fgc); break;
-            case 'y': add_y_offset(strtol(optarg, NULL, 10)); break;
             case 'r': borders = true; break;
         }
     }
