@@ -110,6 +110,7 @@ static int offset_y_index = 0;
 static uint32_t attrs = 0;
 static bool dock = false;
 static bool topbar = true;
+static bool borders = false;
 static int bw = -1, bh = -1, bx = 0, by = 0;
 static int bu = 1; // Underline height
 static rgba_t fgc, bgc, ugc;
@@ -262,6 +263,15 @@ draw_lines (monitor_t *mon, int x, int w)
         fill_rect(mon->pixmap, gc[GC_ATTR], x, 0, w, bu);
     if (attrs & ATTR_UNDERL)
         fill_rect(mon->pixmap, gc[GC_ATTR], x, bh - bu, w, bu);
+}
+
+void
+draw_borders (monitor_t *mon)
+{
+    fill_rect(mon->pixmap, gc[GC_ATTR], 0, 0, bw, bu);
+    fill_rect(mon->pixmap, gc[GC_ATTR], 0, bh - bu, bw, bu);
+    fill_rect(mon->pixmap, gc[GC_ATTR], 0, 0, bu, bw);
+    fill_rect(mon->pixmap, gc[GC_ATTR], bw - bu, 0, bu, bw);
 }
 
 void
@@ -819,6 +829,11 @@ parse (char *text)
 
             pos_x += w;
             area_shift(cur_mon->window, align, w);
+
+            // Draw full borders around the bar
+            if(borders)
+        		draw_borders(cur_mon);
+
         }
     }
     XftDrawDestroy (xft_draw);
@@ -1575,6 +1590,7 @@ main (int argc, char **argv)
     dfgc = fgc = WHITE;
     dugc = ugc = fgc;
 
+
     // A safe default
     wm_name = NULL;
 
@@ -1583,7 +1599,7 @@ main (int argc, char **argv)
     // Connect to the Xserver and initialize scr
     xconn();
 
-    while ((ch = getopt(argc, argv, "hg:o:bdf:a:pu:B:F:U:n:y")) != -1) {
+    while ((ch = getopt(argc, argv, "hg:o:bdf:a:pu:B:F:U:n:y:r")) != -1) {
         switch (ch) {
             case 'h':
                 printf ("lemonbar version %s\n", VERSION);
@@ -1613,6 +1629,7 @@ main (int argc, char **argv)
             case 'F': dfgc = fgc = parse_color(optarg, NULL, WHITE); break;
             case 'U': dugc = ugc = parse_color(optarg, NULL, fgc); break;
             case 'y': add_y_offset(strtol(optarg, NULL, 10)); break;
+            case 'r': borders = true; break;
         }
     }
 
